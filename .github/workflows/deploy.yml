@@ -1,15 +1,10 @@
-# Deploy Vite + React portfolio to GitHub Pages
-# Docs: https://vite.dev/guide/static-deploy
-# This repo needs ONE manual step in GitHub UI to allow the workflow to create the Pages site:
-#   Settings → Pages → Build and deployment → Source → GitHub Actions
-#   Settings → Actions → General → Workflow permissions → Read and write permissions → Save
-# After that, every push to main auto-deploys with base '/PORTFOLIO/' (vite.config.js:10).
-# See also: https://docs.github.com/en/pages/getting-started-with-github-pages/configuring-a-publishing-source-for-your-github-pages-site
-name: Deploy to GitHub Pages
+# Deploy Vite + React portfolio to GitHub Pages — DISABLED (deploy is on Vercel)
+# If you want GitHub Pages instead of Vercel, re-enable by restoring `push: branches: [main]`
+# and do ONE manual step: Settings → Pages → Build and deployment → Source → GitHub Actions
+# + Settings → Actions → General → Workflow permissions → Read and write → Save
+name: Deploy to GitHub Pages (disabled — Vercel is active)
 
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
 
 permissions:
