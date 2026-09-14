@@ -323,7 +323,22 @@ function useSupabaseProjects() {
       setProjects((prev) => prev.map((p) => (p.id === id ? normalizeProject({ ...p, ...payload, id }) : p)));
       return;
     }
-    // Don't send id in update payload
+
+    // Fallback/default projects use IDs like "1", "2", "3".
+    // Supabase uses UUIDs, so those IDs cannot be used in .eq("id", id).
+    const isUuid =
+      typeof id === "string" &&
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(id);
+
+    if (!isUuid) {
+      console.log("[Supabase] Fallback project detected. Creating it as a new Supabase project.");
+      const created = await addProject(payload);
+      // Remove the temporary fallback project from the local list
+      setProjects((prev) => prev.filter((p) => p.id !== id));
+      return created;
+    }
+
+    // Real Supabase project — update normally.
     const row = toRowPayload(payload);
     const { data, error: err } = await supabase.from("projects").update(row).eq("id", id).select().single();
     if (err) throw err;
@@ -335,6 +350,14 @@ function useSupabaseProjects() {
   const deleteProject = async (id) => {
     const target = projects.find((p) => p.id === id);
     if (!isSupabaseConfigured || !supabase) {
+      setProjects((prev) => prev.filter((p) => p.id !== id));
+      return;
+    }
+    // Fallback IDs ("1","2","3") are not UUIDs and not in Supabase — just remove locally
+    const isUuid =
+      typeof id === "string" &&
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(id);
+    if (!isUuid) {
       setProjects((prev) => prev.filter((p) => p.id !== id));
       return;
     }
