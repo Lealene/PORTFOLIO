@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="800" height="500" viewBox="0 0 800 500">
+  <defs>
+    <linearGradient id="g1" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#050713"/>
+      <stop offset="100%" stop-color="#0f1225"/>
+    </linearGradient>
+    <linearGradient id="g2" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#ffffff"/>
+      <stop offset="100%" stop-color="#e6e8f0"/>
+    </linearGradient>
+  </defs>
+  <rect width="800" height="500" fill="url(#g1)"/>
+  <!-- split card: black &amp; white -->
+  <rect x="120" y="60" width="560" height="380" rx="16" fill="white" />
+  <rect x="120" y="60" width="280" height="380" rx="16" fill="#0a0a0a"/>
+  <rect x="380" y="60" width="20" height="380" fill="none"/>
+  <!-- left black side -->
+  <text x="260" y="140" font-family="Arial" font-size="42" font-weight="300" text-anchor="middle" fill="white" letter-spacing="-1">Hello</text>
+  <text x="260" y="172" font-family="Arial" font-size="42" font-weight="700" text-anchor="middle" fill="white" letter-spacing="-1">Again!</text>
+  <text x="260" y="200" font-family="Arial" font-size="10" letter-spacing="3" text-anchor="middle" fill="rgba(255,255,255,0.5)">WELCOME BACK</text>
+  <rect x="170" y="225" width="180" height="36" rx="18" fill="rgba(255,255,255,0.10)" stroke="rgba(255,255,255,0.15)"/>
+  <text x="260" y="248" font-family="Arial" font-size="11" letter-spacing="2" text-anchor="middle" fill="white">SIGN IN</text>
+  <!-- right white side -->
+  <text x="540" y="135" font-family="Arial" font-size="13" letter-spacing="2" text-anchor="middle" fill="#0a0a0a">LOGIN</text>
+  <rect x="460" y="155" width="160" height="38" rx="8" fill="none" stroke="#0a0a0a" stroke-width="1.2" opacity="0.9"/>
+  <text x="470" y="178" font-family="Arial" font-size="11" fill="rgba(0,0,0,0.35)">▢ Email</text>
+  <rect x="460" y="205" width="160" height="38" rx="8" fill="none" stroke="#0a0a0a" stroke-width="1.2" opacity="0.9"/>
+  <text x="470" y="228" font-family="Arial" font-size="11" fill="rgba(0,0,0,0.35)">▢ Password</text>
+  <rect x="460" y="265" width="160" height="36" rx="18" fill="#0a0a0a"/>
+  <text x="540" y="288" font-family="Arial" font-size="11" letter-spacing="2" text-anchor="middle" fill="white">LOGIN →</text>
+  <text x="540" y="315" font-family="Arial" font-size="9" letter-spacing="1" text-anchor="middle" fill="rgba(0,0,0,0.45)">MINIMALIST AUTH UI</text>
+</svg>
