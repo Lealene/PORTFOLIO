@@ -624,6 +624,8 @@ function AdminPanel({ projects, setProjects, addProject, updateProject, deletePr
       // Resolve final image URLs
       let finalUrls = [];
 
+      // Track newly uploaded URLs to clean up if DB insert fails (orphaned files)
+      let newlyUploadedUrls = [];
       if (isSupabaseConfigured && supabase) {
         // Upload any new blob: files to Supabase Storage
         const resolved = [];
@@ -633,6 +635,7 @@ function AdminPanel({ projects, setProjects, addProject, updateProject, deletePr
             setUploadProgress(`Uploading ${file.name}…`);
             const publicUrl = await uploadImageFile(file);
             resolved.push(publicUrl);
+            newlyUploadedUrls.push(publicUrl);
           } else if (preview && !preview.startsWith("blob:") && !preview.startsWith("data:")) {
             // Existing Supabase URL or placeholder path — keep as-is
             resolved.push(preview);
@@ -685,19 +688,41 @@ function AdminPanel({ projects, setProjects, addProject, updateProject, deletePr
         const oldUrls = existing ? [existing.image, ...(existing.media||[]).map((m)=>m.src)].filter(Boolean) : [];
         const removed = oldUrls.filter((u) => !finalUrls.includes(u) && u.includes("supabase.co"));
         if (isSupabaseConfigured) {
-          await updateProject(editingId, payload);
+          try {
+            await updateProject(editingId, payload);
+          } catch (dbErr) {
+            // Clean up newly uploaded files if DB update failed (avoid orphans)
+            for (const u of newlyUploadedUrls) await deleteStorageByUrl(u);
+            throw dbErr;
+          }
           for (const u of removed) await deleteStorageByUrl(u);
         } else {
           await updateProject(editingId, payload);
         }
       } else {
-        await addProject(payload);
+        if (isSupabaseConfigured) {
+          try {
+            await addProject(payload);
+          } catch (dbErr) {
+            for (const u of newlyUploadedUrls) await deleteStorageByUrl(u);
+            throw dbErr;
+          }
+        } else {
+          await addProject(payload);
+        }
       }
       resetForm();
       setTimeout(() => document.getElementById("projects")?.scrollIntoView({ behavior: "smooth" }), 100);
     } catch (err) {
       console.error(err);
-      alert(`Failed to save project: ${err.message || err}`);
+      // If image upload failed, tell user clearly; if DB failed after upload, we already cleaned orphans
+      if (err.message && err.message.includes("Supabase not configured")) {
+        alert(`Supabase not configured: ${err.message}`);
+      } else if (err.message && err.message.toLowerCase().includes("storage")) {
+        alert(`Image upload failed: ${err.message}\nProject was NOT saved. Try a smaller image or check Supabase Storage bucket 'project-images' exists and is public.`);
+      } else {
+        alert(`Failed to save project: ${err.message || err}\nIf image was uploaded, orphaned files were cleaned up.`);
+      }
     } finally {
       setSubmitting(false);
       setUploadProgress("");
