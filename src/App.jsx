@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import "./App.css";
+import { supabase, isSupabaseConfigured } from "./supabaseClient.js";
 
 const languages = ["HTML","CSS","JS","React","PHP","Node","SQL","Python","Next","Docker","Git","Java"];
 
@@ -125,12 +126,10 @@ function VideoSticker() {
 }
 
 /* =========================================
-   PROJECT DATA - PERSISTENT (replace with Supabase later)
-   TODO: swap usePersistentProjects -> Supabase fetch
-   supabase.from('projects').select('*')
-   supabase.storage.from('project-images').upload()
+   PROJECT DATA — Supabase backed
+   DEFAULT_PROJECTS = fallback when Supabase empty/unreachable
+   (do NOT auto-seed to avoid duplicates; see supabase/schema.sql)
 ========================================= */
-const STORAGE_KEY = "lealene_projects";
 const PLACEHOLDER_BY_TITLE = {
   "POS & Inventory": "/pos-inventory.svg",
   "Real Estate Platform": "/real-estate.svg",
@@ -184,13 +183,10 @@ const DEFAULT_PROJECTS = [
 
 function normalizeProject(p) {
   const placeholder = getProjectPlaceholder(p.title);
-  // Fix image: if missing or looks like old broken jpg path without file, fallback to placeholder
   let image = p.image && p.image.trim() ? p.image : placeholder;
-  // old DEFAULT used .jpg that now exists as copy, but keep svg mapping for cleaner look
   if (image === "/pos-inventory.jpg") image = "/pos-inventory.svg";
   if (image === "/real-estate.jpg") image = "/real-estate.svg";
   if (image === "/login-system.jpg") image = "/login-system.svg";
-  // normalize media: keep only images/videos, drop broken mp4 entries that have no file, ensure at least one item
   let media = Array.isArray(p.media) && p.media.length ? p.media : [{ type: "image", src: image }];
   media = media
     .filter((m) => m && m.src)
@@ -199,7 +195,6 @@ function normalizeProject(p) {
       if (src === "/pos-inventory.jpg" || src === "/pos-inventory-2.jpg" || src === "/pos-inventory-3.jpg") src = "/pos-inventory.svg";
       if (src === "/real-estate.jpg" || src === "/real-estate-2.jpg" || src === "/real-estate-3.jpg") src = "/real-estate.svg";
       if (src === "/login-system.jpg" || src === "/login-system-2.jpg" || src === "/login-system-3.jpg") src = "/login-system.svg";
-      // drop demo videos that do not exist (they were placeholders)
       if (m.type === "video" && src.includes("demo.mp4")) return { type: "image", src: placeholder };
       return { ...m, src };
     });
@@ -207,76 +202,164 @@ function normalizeProject(p) {
   return { ...p, image, media };
 }
 
-const IDB_NAME = "lealene_portfolio_db";
-const IDB_STORE = "kv";
-function idbOpen() {
-  return new Promise((resolve, reject) => {
-    if (typeof indexedDB === "undefined") return reject(new Error("no indexedDB"));
-    const req = indexedDB.open(IDB_NAME, 1);
-    req.onupgradeneeded = () => {
-      try { req.result.createObjectStore(IDB_STORE); } catch {}
-    };
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error);
-  });
-}
-function idbGet(key) {
-  return idbOpen().then((db) => new Promise((resolve, reject) => {
-    const tx = db.transaction(IDB_STORE, "readonly");
-    const req = tx.objectStore(IDB_STORE).get(key);
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error);
-  })).catch(() => undefined);
-}
-function idbSet(key, val) {
-  return idbOpen().then((db) => new Promise((resolve, reject) => {
-    const tx = db.transaction(IDB_STORE, "readwrite");
-    tx.objectStore(IDB_STORE).put(val, key);
-    tx.oncomplete = () => resolve();
-    tx.onerror = () => reject(tx.error);
-  })).catch(() => {});
+/* =========================================
+   Supabase helpers
+========================================= */
+function mapRowToProject(row) {
+  return {
+    id: row.id,
+    number: row.number || "",
+    title: row.title,
+    description: row.description || "",
+    category: row.category || "",
+    image: row.image || getProjectPlaceholder(row.title),
+    media: Array.isArray(row.media) && row.media.length ? row.media : [{ type: "image", src: row.image || getProjectPlaceholder(row.title) }],
+    link: row.link || "#",
+    created_at: row.created_at,
+  };
 }
 
-function usePersistentProjects() {
-  const [projects, setProjects] = useState(() => {
-    if (typeof window === "undefined") return DEFAULT_PROJECTS;
-    try {
-      const saved = window.localStorage.getItem(STORAGE_KEY);
-      if (saved) {
-        const parsed = JSON.parse(saved);
-        if (Array.isArray(parsed)) return parsed.map(normalizeProject);
-      }
-    } catch {}
-    return DEFAULT_PROJECTS;
+function toRowPayload(project) {
+  return {
+    number: project.number || "",
+    title: project.title,
+    description: project.description || "",
+    category: project.category || "",
+    image: project.image || "",
+    media: project.media || [{ type: "image", src: project.image || "" }],
+    link: project.link || "#",
+  };
+}
+
+async function uploadImageFile(file) {
+  if (!isSupabaseConfigured || !supabase) throw new Error("Supabase not configured");
+  const safeName = file.name.replace(/[^a-zA-Z0-9._-]/g, "_");
+  const ext = safeName.includes(".") ? safeName.split(".").pop() : "jpg";
+  const path = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`;
+  const { error } = await supabase.storage.from("project-images").upload(path, file, {
+    cacheControl: "3600",
+    upsert: false,
+    contentType: file.type || `image/${ext}`,
   });
-  const [hydrated, setHydrated] = useState(false);
-  // Load from IndexedDB (larger quota) and migrate from localStorage if needed
+  if (error) throw error;
+  const { data } = supabase.storage.from("project-images").getPublicUrl(path);
+  return data.publicUrl;
+}
+
+function extractStoragePath(url) {
+  if (!url || typeof url !== "string") return null;
+  // Expected: https://<ref>.supabase.co/storage/v1/object/public/project-images/<path>
+  const marker = "/project-images/";
+  const idx = url.indexOf(marker);
+  if (idx === -1) return null;
+  return url.slice(idx + marker.length).split("?")[0];
+}
+
+async function deleteStorageByUrl(url) {
+  const path = extractStoragePath(url);
+  if (!path) return;
+  try {
+    await supabase.storage.from("project-images").remove([path]);
+  } catch (e) {
+    console.warn("[Supabase] failed to delete storage object", path, e);
+  }
+}
+
+function useSupabaseProjects() {
+  const [projects, setProjects] = useState(DEFAULT_PROJECTS);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+
   useEffect(() => {
+    if (!isSupabaseConfigured || !supabase) {
+      setLoading(false);
+      return;
+    }
     let cancelled = false;
     (async () => {
       try {
-        const idbVal = await idbGet(STORAGE_KEY);
-        if (!cancelled && idbVal) {
-          const parsed = typeof idbVal === "string" ? JSON.parse(idbVal) : idbVal;
-          if (Array.isArray(parsed)) setProjects(parsed.map(normalizeProject));
+        const { data, error: fetchError } = await supabase
+          .from("projects")
+          .select("*")
+          .order("created_at", { ascending: true });
+        if (fetchError) throw fetchError;
+        if (cancelled) return;
+        if (data && data.length > 0) {
+          setProjects(data.map(mapRowToProject).map(normalizeProject));
         } else {
-          // No IDB data — try to migrate existing localStorage (from 4-project state in screenshot)
-          const ls = window.localStorage.getItem(STORAGE_KEY);
-          if (ls) await idbSet(STORAGE_KEY, ls);
+          // No rows yet — keep DEFAULT_PROJECTS as fallback display.
+          // Seed via supabase/schema.sql if you want them persisted.
+          setProjects(DEFAULT_PROJECTS);
         }
-      } catch {}
-      if (!cancelled) setHydrated(true);
+        setError(null);
+      } catch (e) {
+        console.error("[Supabase] load projects failed, showing fallback", e);
+        if (!cancelled) setError(e.message || "Failed to load projects");
+        // keep DEFAULT_PROJECTS visible so page is not blank
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
     })();
     return () => { cancelled = true; };
   }, []);
-  // Persist to both IDB (primary, ~50MB) and localStorage (best-effort) — fixes "removed on refresh" when base64 exceeds 5MB
-  useEffect(() => {
-    if (!hydrated) return;
-    const serialized = JSON.stringify(projects);
-    try { window.localStorage.setItem(STORAGE_KEY, serialized); } catch {}
-    idbSet(STORAGE_KEY, serialized);
-  }, [projects, hydrated]);
-  return [projects, setProjects];
+
+  const addProject = async (payload) => {
+    if (!isSupabaseConfigured || !supabase) {
+      console.warn("[Supabase] not configured — adding project locally only");
+      const local = { ...payload, id: Date.now().toString() };
+      setProjects((prev) => [...prev, normalizeProject(local)]);
+      return local;
+    }
+    const row = toRowPayload(payload);
+    const { data, error: err } = await supabase.from("projects").insert(row).select().single();
+    if (err) throw err;
+    const created = normalizeProject(mapRowToProject(data));
+    setProjects((prev) => (prev.some((p) => p.id === created.id) ? prev : [...prev, created]));
+    return created;
+  };
+
+  const updateProject = async (id, payload) => {
+    if (!isSupabaseConfigured || !supabase) {
+      setProjects((prev) => prev.map((p) => (p.id === id ? normalizeProject({ ...p, ...payload, id }) : p)));
+      return;
+    }
+    // Don't send id in update payload
+    const row = toRowPayload(payload);
+    const { data, error: err } = await supabase.from("projects").update(row).eq("id", id).select().single();
+    if (err) throw err;
+    const updated = normalizeProject(mapRowToProject(data));
+    setProjects((prev) => prev.map((p) => (p.id === id ? updated : p)));
+    return updated;
+  };
+
+  const deleteProject = async (id) => {
+    const target = projects.find((p) => p.id === id);
+    if (!isSupabaseConfigured || !supabase) {
+      setProjects((prev) => prev.filter((p) => p.id !== id));
+      return;
+    }
+    const { error: err } = await supabase.from("projects").delete().eq("id", id);
+    if (err) throw err;
+    setProjects((prev) => prev.filter((p) => p.id !== id));
+    // Best-effort delete images from storage
+    if (target) {
+      const urls = [target.image, ...(target.media || []).map((m) => m.src)].filter(Boolean);
+      for (const u of [...new Set(urls)]) {
+        // Only delete Supabase storage URLs, never local placeholders
+        if (u.includes("supabase.co")) await deleteStorageByUrl(u);
+      }
+    }
+  };
+
+  // Local fallback setter (kept for reset-to-defaults button when not configured)
+  const setProjectsLocal = (updater) => {
+    setProjects((prev) => {
+      const next = typeof updater === "function" ? updater(prev) : updater;
+      return Array.isArray(next) ? next.map(normalizeProject) : next;
+    });
+  };
+
+  return { projects, setProjects: setProjectsLocal, loading, error, addProject, updateProject, deleteProject };
 }
 
 /* Shared placeholder component for every project image */
@@ -295,7 +378,6 @@ function SafeImage({ src, alt, className, title, onClick, small }) {
   const [err, setErr] = useState(false);
   const [loaded, setLoaded] = useState(false);
   const [placeholderErr, setPlaceholderErr] = useState(false);
-  // Reset error states when src changes — fixes bug where edited project kept showing old placeholder
   useEffect(() => { setErr(false); setPlaceholderErr(false); setLoaded(false); }, [src]);
   const placeholder = title ? getProjectPlaceholder(title) : FALLBACK_IMAGE;
   const displaySrc = err || !src ? placeholder : src;
@@ -381,12 +463,23 @@ function ProjectGallery({ project, onClose }) {
 /* =========================================
    PROJECTS - PUBLIC (no admin link)
 ========================================= */
-function Projects({ projects }) {
+function Projects({ projects, loading, error }) {
   const [selectedProject, setSelectedProject] = useState(null);
   return (
     <section className="projects" id="projects">
       <div className="section-label">03 — Selected Work</div>
       <h2 className="section-title">PROJECTS</h2>
+      {loading && <p style={{ marginTop: 20, opacity: 0.7, fontSize: 14 }}>Loading projects…</p>}
+      {error && (
+        <p style={{ marginTop: 12, color: "#ffb4a8", fontSize: 13, background: "rgba(255,80,80,0.08)", border: "1px solid rgba(255,80,80,0.2)", padding: "10px 14px", borderRadius: 8 }}>
+          Could not load from Supabase ({error}) — showing fallback projects.
+        </p>
+      )}
+      {!isSupabaseConfigured && (
+        <p style={{ marginTop: 12, color: "#ffcc66", fontSize: 13, background: "rgba(255,200,80,0.08)", border: "1px solid rgba(255,200,80,0.3)", padding: "10px 14px", borderRadius: 8 }}>
+          ⚠️ Supabase NOT connected — projects are in <b>local-only fallback</b> and will <b>NOT appear on other devices</b>. To fix: create a Supabase project, run <code>supabase/schema.sql</code>, then set <code>VITE_SUPABASE_URL</code> + <code>VITE_SUPABASE_ANON_KEY</code> in <code>.env.local</code> (local) and Vercel → Settings → Environment Variables (deployed). See <code>.env.example</code>.
+        </p>
+      )}
       <div className="projects-grid">
         {projects.map((project) => (
           <article className="project" key={project.id || project.title}>
@@ -414,12 +507,8 @@ function Projects({ projects }) {
 
 /* =========================================
    ADMIN - SECURED (separate route, login required)
-   Visitors never see this. Go to /#secret-admin to access.
-   Current check is client-side — replace with Supabase Auth for production:
-     supabase.auth.signInWithPassword({email,password})
 ========================================= */
 const ADMIN_ROUTE = "#secret-admin";
-// Change this password before publishing. For real security, replace with Supabase Auth.
 const ADMIN_PASSWORD = "lealene2026";
 
 function AdminLogin({ onSuccess }) {
@@ -448,7 +537,8 @@ function AdminLogin({ onSuccess }) {
   );
 }
 
-function compressImageFile(file, maxW = 1600, maxH = 1600, quality = 0.78) {
+// Kept for local fallback when Supabase env vars are missing — not used in Supabase mode
+function compressImageFileFallback(file, maxW = 1600, maxH = 1600, quality = 0.78) {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.onerror = () => reject(new Error("read failed"));
@@ -463,7 +553,6 @@ function compressImageFile(file, maxW = 1600, maxH = 1600, quality = 0.78) {
         canvas.width = w; canvas.height = h;
         const ctx = canvas.getContext("2d");
         ctx.drawImage(img, 0, 0, w, h);
-        // Use jpeg for photos (smaller), png for images with transparency would lose alpha but still visible
         const outType = file.type === "image/png" && quality >= 0.9 ? "image/png" : "image/jpeg";
         try { resolve(canvas.toDataURL(outType, quality)); } catch (e) { reject(e); }
       };
@@ -473,84 +562,189 @@ function compressImageFile(file, maxW = 1600, maxH = 1600, quality = 0.78) {
   });
 }
 
-function AdminPanel({ projects, setProjects, onLogout }) {
-  const [title, setTitle] = useState(""); const [number, setNumber] = useState(""); const [description, setDescription] = useState(""); const [link, setLink] = useState(""); const [images, setImages] = useState([]); const [editingId, setEditingId] = useState(null); const [dragOver, setDragOver] = useState(false); const [reading, setReading] = useState(0);
+function AdminPanel({ projects, setProjects, addProject, updateProject, deleteProject, onLogout }) {
+  const [title, setTitle] = useState(""); const [number, setNumber] = useState(""); const [description, setDescription] = useState(""); const [link, setLink] = useState("");
+  const [previews, setPreviews] = useState([]); // string[] — blob: URLs for new files, https URLs for existing
+  const pendingFilesRef = useRef(new Map()); // previewUrl -> File
+  const [editingId, setEditingId] = useState(null); const [dragOver, setDragOver] = useState(false);
+  const [submitting, setSubmitting] = useState(false); const [uploadProgress, setUploadProgress] = useState("");
   const fileInputRef = useRef(null);
-  const resetForm = () => { setTitle(""); setNumber(""); setDescription(""); setLink(""); setImages([]); setEditingId(null); setReading(0); if (fileInputRef.current) fileInputRef.current.value = ""; };
-  const handleImageFiles = async (fileList) => {
-    const files = Array.from(fileList || []).filter(Boolean);
-    if (!files.length) return;
-    // Allow any image type — filter only non-images with a friendly message but keep valid ones
-    const imageFiles = files.filter((f) => f.type.startsWith("image/"));
-    if (imageFiles.length !== files.length) alert("Some files were not images and were skipped. Any image type (jpg, png, webp, etc.) is allowed.");
-    if (!imageFiles.length) return;
-    setReading((c) => c + imageFiles.length);
-    for (const file of imageFiles) {
-      try {
-        // Any large size is allowed — we compress to fit correctly and to stay within localStorage limits
-        // >1.2MB or >1600px will be resized/compressed; smaller files are kept as-is for quality
-        let dataUrl;
-        if (file.size > 1024 * 1024 || file.type === "image/png" || file.type === "image/webp") {
-          try { dataUrl = await compressImageFile(file, 1600, 1600, 0.78); } catch { dataUrl = await new Promise((res, rej) => { const r=new FileReader(); r.onload=()=>res(r.result); r.onerror=rej; r.readAsDataURL(file); }); }
-        } else {
-          dataUrl = await new Promise((res, rej) => { const r=new FileReader(); r.onload=()=>res(r.result); r.onerror=rej; r.readAsDataURL(file); });
-        }
-        setImages((prev) => [...prev, dataUrl]);
-      } catch {
-        alert(`Failed to process ${file.name}`);
-      } finally {
-        setReading((c) => c - 1);
-      }
-    }
+
+  const resetForm = () => {
+    // Revoke blob URLs to avoid memory leak
+    previews.forEach((p) => { if (p.startsWith("blob:")) try { URL.revokeObjectURL(p); } catch {} });
+    pendingFilesRef.current.clear();
+    setTitle(""); setNumber(""); setDescription(""); setLink(""); setPreviews([]); setEditingId(null); setUploadProgress(""); setSubmitting(false);
     if (fileInputRef.current) fileInputRef.current.value = "";
   };
-  const removeImageAt = (idx) => setImages((prev) => prev.filter((_, i) => i !== idx));
-  const handleSubmit = (e) => {
-    e.preventDefault();
-    if (reading > 0) {
-      // Don't block hard — just inform, images that finished will still be saved
-      console.warn("Images still processing, saving what is ready...");
+
+  // Cleanup blob URLs on unmount
+  useEffect(() => () => {
+    previews.forEach((p) => { if (p.startsWith("blob:")) try { URL.revokeObjectURL(p); } catch {} });
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const handleImageFiles = (fileList) => {
+    const files = Array.from(fileList || []).filter(Boolean);
+    if (!files.length) return;
+    const imageFiles = files.filter((f) => f.type.startsWith("image/"));
+    if (imageFiles.length !== files.length) alert("Some files were not images and were skipped.");
+    if (!imageFiles.length) return;
+    const newPreviews = [];
+    for (const file of imageFiles) {
+      const preview = URL.createObjectURL(file);
+      pendingFilesRef.current.set(preview, file);
+      newPreviews.push(preview);
     }
-    if (!title.trim() || !description.trim()) { alert("Title and description required."); return; }
-    // No confirm blocking — if no image, silently use placeholder so posting never appears "stuck"
-    const fallbackImg = getProjectPlaceholder(title.trim());
-    const existing = editingId ? projects.find((p) => p.id === editingId) : null;
-    // Build final media: use newly uploaded images if any, otherwise keep existing, otherwise fallback
-    let finalImages = [];
-    if (images.length) finalImages = images;
-    else if (existing?.media?.length) finalImages = existing.media.map((m) => m.src).filter(Boolean);
-    else if (existing?.image) finalImages = [existing.image];
-    else finalImages = [fallbackImg];
-    // Ensure every src will fit correctly — already compressed to max 1600px, object-fit:cover in cards
-    const finalImage = finalImages[0];
-    const payload = {
-      id: editingId || Date.now().toString(),
-      number: number.trim() || `${String(projects.length+1).padStart(2,"0")} / PROJECT`,
-      title: title.trim(),
-      description: description.trim(),
-      image: finalImage,
-      media: finalImages.map((src) => ({ type: "image", src })),
-      link: link.trim() || "#",
-    };
-    if (editingId) setProjects((prev)=>prev.map((p)=> p.id===editingId?payload:p));
-    else setProjects((prev)=>[...prev, payload]);
-    resetForm();
-    // Scroll to projects to show result
-    setTimeout(() => document.getElementById("projects")?.scrollIntoView({ behavior: "smooth" }), 100);
+    setPreviews((prev) => [...prev, ...newPreviews]);
+    if (fileInputRef.current) fileInputRef.current.value = "";
   };
+
+  const removeImageAt = (idx) => {
+    const url = previews[idx];
+    if (url && url.startsWith("blob:")) {
+      try { URL.revokeObjectURL(url); } catch {}
+      pendingFilesRef.current.delete(url);
+    }
+    setPreviews((prev) => prev.filter((_, i) => i !== idx));
+  };
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    if (!title.trim() || !description.trim()) { alert("Title and description required."); return; }
+    if (!isSupabaseConfigured || !supabase) {
+      alert("Supabase is NOT configured — this project will only save on THIS browser and will NOT show on other devices/phone after deploy.\n\nTo enable cross-device sync:\n1. Create Supabase project at supabase.com\n2. Run supabase/schema.sql in SQL Editor\n3. Create .env.local with VITE_SUPABASE_URL + VITE_SUPABASE_ANON_KEY\n4. Add same vars to Vercel → Settings → Environment Variables\n5. Redeploy\n\nSave anyway locally?");
+    }
+    if (submitting) return;
+    setSubmitting(true);
+    setUploadProgress(isSupabaseConfigured ? "Uploading images…" : "Saving locally (NOT synced)…");
+    try {
+      const fallbackImg = getProjectPlaceholder(title.trim());
+      const existing = editingId ? projects.find((p) => p.id === editingId) : null;
+
+      // Resolve final image URLs
+      let finalUrls = [];
+
+      if (isSupabaseConfigured && supabase) {
+        // Upload any new blob: files to Supabase Storage
+        const resolved = [];
+        for (const preview of previews) {
+          const file = pendingFilesRef.current.get(preview);
+          if (file) {
+            setUploadProgress(`Uploading ${file.name}…`);
+            const publicUrl = await uploadImageFile(file);
+            resolved.push(publicUrl);
+          } else if (preview && !preview.startsWith("blob:") && !preview.startsWith("data:")) {
+            // Existing Supabase URL or placeholder path — keep as-is
+            resolved.push(preview);
+          } else if (preview && preview.startsWith("data:")) {
+            // Legacy data URL (should not happen in Supabase mode) — keep but warn
+            console.warn("[Admin] data URL in Supabase mode, keeping as-is (will not be uploaded)");
+            resolved.push(preview);
+          }
+        }
+        if (resolved.length) finalUrls = resolved;
+        else if (existing?.media?.length) finalUrls = existing.media.map((m) => m.src).filter(Boolean);
+        else if (existing?.image) finalUrls = [existing.image];
+        else finalUrls = [fallbackImg];
+      } else {
+        // Local fallback mode (no Supabase env) — keep old base64 behavior so dev still works
+        // Convert pending File previews to base64
+        const resolved = [];
+        for (const preview of previews) {
+          const file = pendingFilesRef.current.get(preview);
+          if (file) {
+            let dataUrl;
+            if (file.size > 1024 * 1024 || file.type === "image/png" || file.type === "image/webp") {
+              try { dataUrl = await compressImageFileFallback(file, 1600, 1600, 0.78); } catch { dataUrl = await new Promise((res, rej) => { const r=new FileReader(); r.onload=()=>res(r.result); r.onerror=rej; r.readAsDataURL(file); }); }
+            } else {
+              dataUrl = await new Promise((res, rej) => { const r=new FileReader(); r.onload=()=>res(r.result); r.onerror=rej; r.readAsDataURL(file); });
+            }
+            resolved.push(dataUrl);
+          } else {
+            resolved.push(preview);
+          }
+        }
+        if (resolved.length) finalUrls = resolved;
+        else if (existing?.media?.length) finalUrls = existing.media.map((m) => m.src).filter(Boolean);
+        else if (existing?.image) finalUrls = [existing.image];
+        else finalUrls = [fallbackImg];
+      }
+
+      const finalImage = finalUrls[0];
+      const payload = {
+        number: number.trim() || `${String(projects.length+1).padStart(2,"0")} / PROJECT`,
+        title: title.trim(),
+        description: description.trim(),
+        image: finalImage,
+        media: finalUrls.map((src) => ({ type: "image", src })),
+        link: link.trim() || "#",
+      };
+
+      if (editingId) {
+        // If editing, delete old storage objects that are no longer used (best-effort)
+        const oldUrls = existing ? [existing.image, ...(existing.media||[]).map((m)=>m.src)].filter(Boolean) : [];
+        const removed = oldUrls.filter((u) => !finalUrls.includes(u) && u.includes("supabase.co"));
+        if (isSupabaseConfigured) {
+          await updateProject(editingId, payload);
+          for (const u of removed) await deleteStorageByUrl(u);
+        } else {
+          await updateProject(editingId, payload);
+        }
+      } else {
+        await addProject(payload);
+      }
+      resetForm();
+      setTimeout(() => document.getElementById("projects")?.scrollIntoView({ behavior: "smooth" }), 100);
+    } catch (err) {
+      console.error(err);
+      alert(`Failed to save project: ${err.message || err}`);
+    } finally {
+      setSubmitting(false);
+      setUploadProgress("");
+    }
+  };
+
   const handleEdit = (project) => {
+    // Clear previous pending blobs
+    previews.forEach((p) => { if (p.startsWith("blob:")) try { URL.revokeObjectURL(p); } catch {} });
+    pendingFilesRef.current.clear();
     setEditingId(project.id); setTitle(project.title); setNumber(project.number); setDescription(project.description); setLink(project.link);
     const existingMedia = project.media?.map((m) => m.src).filter(Boolean) || (project.image ? [project.image] : []);
-    setImages(existingMedia);
+    setPreviews(existingMedia);
     window.scrollTo({top:0,behavior:"smooth"});
   };
-  const handleDelete = (id) => { if(!confirm("Delete this project?")) return; setProjects((prev)=>prev.filter((p)=>p.id!==id)); if(editingId===id) resetForm(); };
-  const handleResetDefaults = () => { if(!confirm("Reset to default 3 projects?")) return; setProjects(DEFAULT_PROJECTS); resetForm(); };
+
+  const handleDelete = async (id) => {
+    if(!confirm("Delete this project?")) return;
+    try {
+      await deleteProject(id);
+      if(editingId===id) resetForm();
+    } catch (err) {
+      alert(`Delete failed: ${err.message || err}`);
+    }
+  };
+
+  const handleResetDefaults = () => {
+    if(!confirm("Reset to default 3 projects? (Local only — Supabase data is not affected. To reset Supabase, delete rows in the dashboard.)")) return;
+    setProjects(DEFAULT_PROJECTS);
+    resetForm();
+  };
 
   return (
     <section className="admin" id="admin">
       <div className="admin-header">
-        <div><div className="section-label">ADMIN — PROJECT MANAGER</div><h2 className="section-title">MANAGE PROJECTS</h2><p className="admin-subtitle">Add / Edit / Delete projects. Images stored as base64 locally for now — swap to Supabase Storage so every visitor sees the same data. Public site has <b>no</b> admin link.</p></div>
+        <div><div className="section-label">ADMIN — PROJECT MANAGER</div><h2 className="section-title">MANAGE PROJECTS</h2>
+          <p className="admin-subtitle">
+            {isSupabaseConfigured
+              ? "✅ Supabase connected — images go to Storage (project-images) and URLs to the projects table — visible on every device."
+              : "❌ Supabase NOT connected — projects are saved locally only and will DISAPPEAR on other devices. Fix: add VITE_SUPABASE_URL + VITE_SUPABASE_ANON_KEY to .env.local and Vercel env vars, then redeploy."}
+          </p>
+          {!isSupabaseConfigured && (
+            <p style={{ marginTop: 8, fontSize: 12, color: "#ffcc66", background: "rgba(255,200,80,0.08)", border: "1px solid rgba(255,200,80,0.3)", padding: "8px 10px", borderRadius: 6 }}>
+              After you add the keys, restart <code>npm run dev</code> and hard-refresh. Deployed site needs Vercel redeploy.
+            </p>
+          )}
+        </div>
         <div style={{display:"flex",gap:10}}>
           <button onClick={onLogout} className="admin-back" style={{background:"transparent", cursor:"pointer"}}>Logout</button>
           <a href="#" className="admin-back">← Portfolio</a>
@@ -563,11 +757,11 @@ function AdminPanel({ projects, setProjects, onLogout }) {
           <label>Category / Number<input value={number} onChange={(e)=>setNumber(e.target.value)} placeholder="01 / WEB APPLICATION" /></label>
           <label>Description *<textarea value={description} onChange={(e)=>setDescription(e.target.value)} placeholder="A point-of-sale..." rows={4} required /></label>
           <label>Project Link<input value={link} onChange={(e)=>setLink(e.target.value)} placeholder="https://github.com/lealene/pos-inventory" type="text" inputMode="url" /></label>
-          <label>Project Images — multiple, any size/type (auto-fitted) *
-            <div className={`image-drop ${dragOver?"drag-over":""} ${images.length?"has-image":""}`} onClick={() => fileInputRef.current?.click()} onDragOver={(e)=>{e.preventDefault(); setDragOver(true);}} onDragLeave={()=>setDragOver(false)} onDrop={(e)=>{e.preventDefault(); setDragOver(false); handleImageFiles(e.dataTransfer.files);}}>
-              {reading > 0 ? <span>Processing {reading} image(s)...</span> : images.length ? (
+          <label>Project Images — multiple, any size/type (auto-fitted)
+            <div className={`image-drop ${dragOver?"drag-over":""} ${previews.length?"has-image":""}`} onClick={() => fileInputRef.current?.click()} onDragOver={(e)=>{e.preventDefault(); setDragOver(true);}} onDragLeave={()=>setDragOver(false)} onDrop={(e)=>{e.preventDefault(); setDragOver(false); handleImageFiles(e.dataTransfer.files);}}>
+              {submitting && uploadProgress ? <span>{uploadProgress}</span> : previews.length ? (
                 <div className="image-preview-grid">
-                  {images.map((src, idx) => (
+                  {previews.map((src, idx) => (
                     <div key={idx} className="image-preview-cell">
                       <img src={src} alt={`preview ${idx+1}`} className="image-preview" onError={(e)=>{ e.currentTarget.src = getProjectPlaceholder(title || "Project"); }} />
                       <button type="button" className="image-remove" onClick={(ev)=>{ ev.stopPropagation(); removeImageAt(idx); }} aria-label="Remove image">×</button>
@@ -575,22 +769,22 @@ function AdminPanel({ projects, setProjects, onLogout }) {
                     </div>
                   ))}
                 </div>
-              ) : <span>Drag & drop images here or click to choose — multiple allowed, any size/type will be auto-compressed to fit</span>}
+              ) : <span>Drag & drop images here or click to choose — multiple allowed, any size/type will be uploaded to Supabase Storage</span>}
               <input ref={fileInputRef} type="file" accept="image/*" multiple onChange={(e)=>handleImageFiles(e.target.files)} style={{display:"none"}} />
             </div>
             <div style={{display:"flex", gap:8, marginTop:8}}>
-              {images.length>0 && <button type="button" className="btn-text" onClick={()=>setImages([])}>Clear all</button>}
-              <span className="field-hint" style={{marginLeft:"auto"}}>{images.length} image(s) • first is cover • auto-fitted with object-fit:cover, large files compressed to ~1600px</span>
+              {previews.length>0 && <button type="button" className="btn-text" onClick={()=>setPreviews([])}>Clear all</button>}
+              <span className="field-hint" style={{marginLeft:"auto"}}>{previews.length} image(s) • first is cover • auto-fitted with object-fit:cover{submitting ? " • uploading…" : ""}</span>
             </div>
-            <span className="field-hint">Any image type (jpg, png, webp, gif) and any large size is allowed — images are compressed in-browser to fit correctly in the project card and gallery (object-fit). After Add/Update, check <b>03 — Selected Work</b>.</span>
+            <span className="field-hint">Images are uploaded as files to Supabase Storage (bucket: project-images) — no base64 stored in DB. Public URL is saved in the projects table.</span>
           </label>
             <div className="admin-actions">
-             <button type="submit" className="btn-primary">{reading>0 ? `Processing ${reading}...` : editingId?"Update Project":"Add Project"}</button>
-             {editingId && <button type="button" className="btn-secondary" onClick={resetForm}>Cancel</button>}
+             <button type="submit" className="btn-primary" disabled={submitting}>{submitting ? (uploadProgress || "Saving…") : editingId?"Update Project":"Add Project"}</button>
+             {editingId && <button type="button" className="btn-secondary" onClick={resetForm} disabled={submitting}>Cancel</button>}
            </div>
           <div className="admin-utils">
-            <button type="button" className="btn-text" onClick={handleResetDefaults}>Reset to defaults</button>
-            <span className="project-count">{projects.length} project(s) saved</span>
+            <button type="button" className="btn-text" onClick={handleResetDefaults}>Reset to defaults (local)</button>
+            <span className="project-count">{projects.length} project(s) {isSupabaseConfigured ? "from Supabase" : "(local fallback)"}</span>
           </div>
         </form>
         <div className="admin-list">
@@ -618,17 +812,15 @@ function App() {
   const [loading, setLoading] = useState(() => {
     if (typeof window === "undefined") return true;
     if (window.location.hash === ADMIN_ROUTE) return false;
-    // Don't show loader on repeated refreshes — only first open per tab session
     if (sessionStorage.getItem("hasSeenLoading") === "1") return false;
     return true;
   });
-  const [projects, setProjects] = usePersistentProjects();
+  const { projects, setProjects, loading: projectsLoading, error: projectsError, addProject, updateProject, deleteProject } = useSupabaseProjects();
   const [adminRoute, setAdminRoute] = useState(()=>typeof window!=="undefined" && window.location.hash===ADMIN_ROUTE);
   const [authed, setAuthed] = useState(()=>typeof window!=="undefined" && sessionStorage.getItem("lealene_admin")==="1");
 
   useEffect(() => {
     if (!loading) return;
-    // Only show loading animation on public portfolio, skip it for #secret-admin so admin is instant
     if (typeof window !== "undefined" && window.location.hash === ADMIN_ROUTE) {
       setLoading(false);
       return;
@@ -644,7 +836,6 @@ function App() {
     const onHash = ()=> {
       const isAdmin = window.location.hash===ADMIN_ROUTE;
       setAdminRoute(isAdmin);
-      // If user navigates to admin while still loading, cancel loading immediately
       if (isAdmin) setLoading(false);
     };
     window.addEventListener("hashchange", onHash);
@@ -652,10 +843,9 @@ function App() {
   }, []);
   const handleLogout = ()=>{ sessionStorage.removeItem("lealene_admin"); setAuthed(false); window.location.hash=""; };
 
-  // Admin route renders instantly — no loading screen
   if (adminRoute) {
     if (!authed) return <div className="app"><nav><div className="logo">LF.</div><ul className="nav-links"><li><a href="#">Portfolio</a></li></ul></nav><AdminLogin onSuccess={()=>setAuthed(true)} /><footer><span>© 2026 LEALENE FAJARDO</span><span>WEB DEVELOPER</span></footer></div>;
-    return <div className="app"><nav><div className="logo">LF.</div><ul className="nav-links"><li><a href="#">Portfolio</a></li><li><a href={ADMIN_ROUTE}>Admin</a></li></ul></nav><AdminPanel projects={projects} setProjects={setProjects} onLogout={handleLogout} /><footer><span>© 2026 LEALENE FAJARDO</span><span>WEB DEVELOPER</span></footer></div>;
+    return <div className="app"><nav><div className="logo">LF.</div><ul className="nav-links"><li><a href="#">Portfolio</a></li><li><a href={ADMIN_ROUTE}>Admin</a></li></ul></nav><AdminPanel projects={projects} setProjects={setProjects} addProject={addProject} updateProject={updateProject} deleteProject={deleteProject} onLogout={handleLogout} /><footer><span>© 2026 LEALENE FAJARDO</span><span>WEB DEVELOPER</span></footer></div>;
   }
 
   if (loading) {
@@ -728,7 +918,7 @@ function App() {
         <div className="section-label">02 — Skills</div><h2 className="section-title">WHAT I USE</h2>
         <div className="skills-grid"><div className="skill">HTML / CSS</div><div className="skill">JavaScript</div><div className="skill">React</div><div className="skill">Next.js</div><div className="skill">Node.js</div><div className="skill">PHP</div><div className="skill">Python</div><div className="skill">Android Studio</div><div className="skill">XAMPP</div><div className="skill">PostgreSQL</div><div className="skill">MySQL</div><div className="skill">Tailwind CSS</div><div className="skill">Git / GitHub</div><div className="skill">Docker</div><div className="skill">Strapi</div><div className="skill">OpenCode</div></div>
       </section>
-      <Projects projects={projects} />
+      <Projects projects={projects} loading={projectsLoading} error={projectsError} />
       <section className="experience">
         <div className="section-label">04 — Experience</div><h2 className="section-title">MY JOURNEY</h2>
         <div className="experience-list">
